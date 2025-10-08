@@ -1,0 +1,271 @@
+// ------------------------- Shared assets / utilities -------------------------
+var scatsat = ee.Image('projects/ee-vishaldutt53/assets/Uttrakhand_TIFFs/uttrakhand');
+var shapefile = ee.FeatureCollection('projects/ee-vishaldutt53/assets/ShapeFiles/Shape_Uk');
+
+// Snow/non-snow training point assets (used by multiple runs)
+var trainSnowAsset = ee.FeatureCollection('projects/ee-vishaldutt53/assets/GeometryPoints/SnowPoints');
+var trainNonSnowAsset = ee.FeatureCollection('projects/ee-vishaldutt53/assets/GeometryPoints/NonSnowPoints');
+
+// Utility: convert MultiPoint feature geometry (first feature) into individual point FeatureCollection
+function multiPointToPointsFromCollection(col, classValue) {
+  // Accepts a FeatureCollection where first() is a MultiPoint geometry (as in your assets)
+  var feature = ee.Feature(col.first());
+  var geom = feature.geometry();
+  var coords = ee.List(ee.Array(geom.coordinates()).toList());
+  // convert coordinates to features
+  var pts = coords.map(function(c) {
+    return ee.Feature(ee.Geometry.Point(ee.List(c)), {class: classValue});
+  });
+  return ee.FeatureCollection(pts);
+}
+
+// Utility: compute area of snow (class == 1) in m2 and km2 within AOI
+function computeSnowArea(classifiedImage, region, scale) {
+  var snowMask = classifiedImage.eq(1).rename('snow'); // 1 = snow
+  var areaImage = snowMask.multiply(ee.Image.pixelArea()); // pixel area in m2 where snow==1 (value or 0)
+  var stats = areaImage.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: region,
+    scale: scale,
+    maxPixels: 1e13,
+    bestEffort: true
+  });
+  var area_m2 = ee.Number(stats.get('snow')).max(0); // ensure number
+  var area_km2 = area_m2.divide(1e6);
+  return {area_m2: area_m2, area_km2: area_km2};
+}
+
+// Utility: compute metrics (confusion matrix, accuracy etc.) given classifiedImage and modis validation image + validation point assets
+function validateClassification(classifiedImage, modisValidationImage, modisSnowAsset, modisNonSnowAsset, shapefile, scatsatScale, modisScale, runName) {
+  // Build validation points from provided multi-point assets (first feature contains multipoint)
+  var modisSnowPoints = multiPointToPointsFromCollection(modisSnowAsset, 1);
+  var modisNonSnowPoints = multiPointToPointsFromCollection(modisNonSnowAsset, 0);
+  var validationPoints = modisSnowPoints.merge(modisNonSnowPoints);
+  // Sample MODIS at validation points (to attach 'class' label)
+  var modisValidationSamples = modisValidationImage.sampleRegions({
+    collection: validationPoints,
+    properties: ['class'],
+    scale: modisScale,
+    tileScale: 2,
+    geometries: true
+  });
+  // Sample classified image at those validation points (this will add 'classification' property)
+  var classifiedValidationSamples = classifiedImage.sampleRegions({
+    collection: modisValidationSamples,
+    properties: ['class'],
+    scale: scatsatScale,
+    tileScale: 2,
+    geometries: true
+  });
+  // Compute confusion matrix and metrics
+  var confusionMatrix = classifiedValidationSamples.errorMatrix('class', 'classification');
+  print(runName + ' Confusion Matrix:', confusionMatrix);
+  var overallAccuracy = confusionMatrix.accuracy();
+  var kappaCoefficient = confusionMatrix.kappa();
+  // safe getters for class-wise metrics (guard against division by zero using max)
+  var cmArr = confusionMatrix.array();
+  var TP = ee.Number(cmArr.get([1,1]));
+  var TN = ee.Number(cmArr.get([0,0]));
+  var FP = ee.Number(cmArr.get([0,1]));
+  var FN = ee.Number(cmArr.get([1,0]));
+  var userAccuracySnow = TP.divide(TP.add(FP)).rename ? TP.divide(TP.add(FP)) : TP.divide(TP.add(FP));
+  var userAccuracyNonSnow = TN.divide(TN.add(FN));
+  var producerAccuracySnow = TP.divide(TP.add(FN));
+  var producerAccuracyNonSnow = TN.divide(TN.add(FP));
+  var f1Snow = userAccuracySnow.multiply(producerAccuracySnow).multiply(2).divide(userAccuracySnow.add(producerAccuracySnow));
+  var f1NonSnow = userAccuracyNonSnow.multiply(producerAccuracyNonSnow).multiply(2).divide(userAccuracyNonSnow.add(producerAccuracyNonSnow));
+  // Print metrics
+  print(runName + ' Overall Accuracy:', overallAccuracy);
+  print(runName + ' Kappa Coefficient:', kappaCoefficient);
+  print(runName + ' User Accuracy (Snow):', userAccuracySnow);
+  print(runName + ' Producer Accuracy (Snow):', producerAccuracySnow);
+  print(runName + ' F1 Score (Snow):', f1Snow);
+  return {
+    confusionMatrix: confusionMatrix,
+    overallAccuracy: overallAccuracy,
+    kappa: kappaCoefficient,
+    userAccuracySnow: userAccuracySnow,
+    producerAccuracySnow: producerAccuracySnow,
+    f1Snow: f1Snow,
+    classifiedValidationSamples: classifiedValidationSamples
+  };
+}
+
+// ------------------------- RUN 1: RF_A1_Daily -------------------------
+(function run_A1_Daily() {
+  var runName = 'RF_A1_Daily';
+  var validationwithMOD_A1_Daily = ee.Image('projects/ee-vishaldutt53/assets/Validation/mod10a1Daily_18-feb');
+
+  var clippedImage = scatsat.clip(shapefile);
+  var clippedMOD_A1_Daily = validationwithMOD_A1_Daily.clip(shapefile);
+
+  // Training points: these appear in your File1 as variables "snow" and "nonsnow" (here using shared training assets)
+  var snowPoints = multiPointToPointsFromCollection(trainSnowAsset, 1);
+  var nonSnowPoints = multiPointToPointsFromCollection(trainNonSnowAsset, 0);
+  var trainingData = snowPoints.merge(nonSnowPoints);
+
+  // Select bands and sample
+  var bands = ['b2']; // you used b2-only in that file; change to ['b1','b2'] if desired
+  var trainingSamples = clippedImage.select(bands).sampleRegions({
+    collection: trainingData,
+    properties: ['class'],
+    scale: 1000,
+    tileScale: 2
+  });
+
+  var classifier = ee.Classifier.smileRandomForest(150).train({
+    features: trainingSamples,
+    classProperty: 'class',
+    inputProperties: bands
+  });
+
+  var classifiedImage = clippedImage.select(bands).classify(classifier); // band name is 'classification'
+
+  // Add to map
+  Map.addLayer(classifiedImage, {min:0, max:1, palette:['green','white']}, runName + ' Classified');
+  Map.addLayer(clippedMOD_A1_Daily, {min:0, max:1, palette:['black','white']}, 'MOD10A1_Daily');
+
+  // Validation + metrics
+  // For File1 you referenced Modis_Snow/Modis_nonsnow for validation; use those assets:
+  var Modis_Snow = ee.FeatureCollection('projects/ee-vishaldutt53/assets/MODA1_SnowPoints'); // check name/path
+  var Modis_nonsnow = ee.FeatureCollection('projects/ee-vishaldutt53/assets/MODA1_NonSnowPoints'); // check name/path
+
+  var metrics = validateClassification(classifiedImage, clippedMOD_A1_Daily, Modis_Snow, Modis_nonsnow, shapefile, 1000, 500, runName);
+
+  // Compute total snow area
+  var area = computeSnowArea(classifiedImage, shapefile.geometry(), 1000);
+  print(runName + ' Total Snow Area (m2):', area.area_m2);
+  print(runName + ' Total Snow Area (km2):', area.area_km2);
+
+  // Optional export: classified image to Drive (uncomment and adjust if needed)
+  /*
+  Export.image.toDrive({
+    image: classifiedImage,
+    description: runName,
+    folder: 'UK_ClassifiedImages',
+    fileNamePrefix: runName + '_SCATSAT_Classification',
+    region: shapefile.geometry(),
+    scale: 1000,
+    maxPixels: 1e13,
+    fileFormat: 'GeoTIFF'
+  });
+  */
+})();
+
+// ------------------------- RUN 2: RF_A2_8Day -------------------------
+(function run_A2_8Day() {
+  var runName = 'RF_A2_8Day';
+  var validationMODIS_A2_8Day = ee.Image('projects/ee-vishaldutt53/assets/mod10_a2_49_2021_8day');
+
+  var clippedScatsat = scatsat.clip(shapefile);
+  var clippedMOD_A2 = validationMODIS_A2_8Day.clip(shapefile);
+
+  // Training points (from assets)
+  var snowPoints = multiPointToPointsFromCollection(trainSnowAsset, 1);
+  var nonSnowPoints = multiPointToPointsFromCollection(trainNonSnowAsset, 0);
+  var trainingData = snowPoints.merge(nonSnowPoints);
+
+  var bands = ['b1', 'b2']; // use both for this run
+  var trainingSamples = clippedScatsat.select(bands).sampleRegions({
+    collection: trainingData,
+    properties: ['class'],
+    scale: 1000,
+    tileScale: 2
+  });
+
+  var classifier = ee.Classifier.smileRandomForest(200).train({
+    features: trainingSamples,
+    classProperty: 'class',
+    inputProperties: bands
+  });
+
+  var classifiedImage = clippedScatsat.select(bands).classify(classifier);
+
+  Map.addLayer(classifiedImage, {min:0, max:1, palette:['green','white']}, runName + ' Classified');
+  Map.addLayer(clippedMOD_A2, {min:0, max:1, palette:['black','white']}, 'MOD10_A2_8Day');
+
+  // Validation: In File2 you referenced A2_snow and A2_nonsnow assets
+  var A2_snow = ee.FeatureCollection('projects/ee-vishaldutt53/assets/GeometryPoints/MODIS_A2_SnowPoints');
+  var A2_nonsnow = ee.FeatureCollection('projects/ee-vishaldutt53/assets/GeometryPoints/MODIS_A2_NonSnowPoints');
+
+  var metrics = validateClassification(classifiedImage, clippedMOD_A2, A2_snow, A2_nonsnow, shapefile, 1000, 500, runName);
+
+  // Compute total snow area
+  var area = computeSnowArea(classifiedImage, shapefile.geometry(), 1000);
+  print(runName + ' Total Snow Area (m2):', area.area_m2);
+  print(runName + ' Total Snow Area (km2):', area.area_km2);
+
+  /*
+  Export.image.toDrive({
+    image: classifiedImage,
+    description: runName,
+    folder: 'UK_ClassifiedImages',
+    fileNamePrefix: runName + '_SCATSAT_Classification',
+    region: shapefile.geometry(),
+    scale: 1000,
+    maxPixels: 1e13,
+    fileFormat: 'GeoTIFF'
+  });
+  */
+})();
+
+// ------------------------- RUN 3: RF_MOD02 -------------------------
+(function run_MOD02() {
+  var runName = 'RF_MOD02';
+  var validationMOD02_18Feb = ee.Image('projects/ee-vishaldutt53/assets/mod02_18-feb_Daily');
+
+  var clippedScatsat = scatsat.clip(shapefile);
+  var clippedMOD02 = validationMOD02_18Feb.clip(shapefile);
+
+  // Training
+  var snowPoints = multiPointToPointsFromCollection(trainSnowAsset, 1);
+  var nonSnowPoints = multiPointToPointsFromCollection(trainNonSnowAsset, 0);
+  var trainingData = snowPoints.merge(nonSnowPoints);
+
+  var bands = ['b1','b2'];
+  var trainingSamples = clippedScatsat.select(bands).sampleRegions({
+    collection: trainingData,
+    properties: ['class'],
+    scale: 1000,
+    tileScale: 2
+  });
+
+  var classifier = ee.Classifier.smileRandomForest(150).train({
+    features: trainingSamples,
+    classProperty: 'class',
+    inputProperties: bands
+  });
+
+  var classifiedImage = clippedScatsat.select(bands).classify(classifier);
+
+  Map.addLayer(classifiedImage, {min:0, max:1, palette:['green','white']}, runName + ' Classified');
+  Map.addLayer(clippedMOD02, {min:0, max:1, palette:['black','white']}, 'MOD02_Daily');
+
+  // Validation: File3 used MOD02_snow / MOD02_nonsnow assets
+  var MOD02_snow = ee.FeatureCollection('projects/ee-vishaldutt53/assets/GeometryPoints/MOD02_SnowPoints');
+  var MOD02_nonsnow = ee.FeatureCollection('projects/ee-vishaldutt53/assets/GeometryPoints/MOD02_NonSnowPoints');
+
+  var metrics = validateClassification(classifiedImage, clippedMOD02, MOD02_snow, MOD02_nonsnow, shapefile, 1000, 500, runName);
+
+  // Compute total snow area
+  var area = computeSnowArea(classifiedImage, shapefile.geometry(), 1000);
+  print(runName + ' Total Snow Area (m2):', area.area_m2);
+  print(runName + ' Total Snow Area (km2):', area.area_km2);
+
+  /*
+  Export.image.toDrive({
+    image: classifiedImage,
+    description: runName,
+    folder: 'GEE_Exports',
+    fileNamePrefix: runName + '_SCATSAT_Classification',
+    region: shapefile.geometry(),
+    scale: 1000,
+    maxPixels: 1e13,
+    fileFormat: 'GeoTIFF'
+  });
+  */
+})();
+
+// ------------------------- End of merged script -------------------------
+Map.centerObject(shapefile, 7);
+print('Merged runs complete. Check console for metrics and area outputs for each run.');
