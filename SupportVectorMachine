@@ -1,0 +1,505 @@
+// ------------------------- Shared utilities & assets -------------------------
+// Shared assets
+var scatsat = ee.Image('projects/ee-vishaldutt53/assets/Uttrakhand_TIFFs/uttrakhand');
+var shapefile = ee.FeatureCollection('projects/ee-vishaldutt53/assets/ShapeFiles/Shape_Uk');
+
+// Training point assets used across runs
+var trainSnowAsset = ee.FeatureCollection('projects/ee-vishaldutt53/assets/GeometryPoints/SnowPoints');
+var trainNonSnowAsset = ee.FeatureCollection('projects/ee-vishaldutt53/assets/GeometryPoints/NonSnowPoints');
+
+// Helper: convert MultiPoint (first feature of a collection) into individual point FC
+function multiPointToPointsFromCollection(col, classValue) {
+  var feat = ee.Feature(col.first());
+  var geom = feat.geometry();
+  // geometry.coordinates() may be nested arrays; convert to list of coords
+  var coords = ee.List(ee.Array(geom.coordinates()).toList());
+  var pts = coords.map(function(c) {
+    return ee.Feature(ee.Geometry.Point(ee.List(c)), {class: classValue});
+  });
+  return ee.FeatureCollection(pts);
+}
+
+// Helper: convert MultiPoint geometry object directly (when geometry provided)
+function multiPointToPointsFromGeometry(multiPointGeom, classValue) {
+  var coords = ee.List(ee.Array(multiPointGeom.coordinates()).toList());
+  var pts = coords.map(function(c) {
+    return ee.Feature(ee.Geometry.Point(ee.List(c)), {class: classValue});
+  });
+  return ee.FeatureCollection(pts);
+}
+
+// Helper: compute snow area (class==1) in m2 and km2 within region
+function computeSnowArea(classifiedImage, region, scale) {
+  var snowMask = classifiedImage.eq(1).rename('snow'); // 1 = snow
+  var areaImage = snowMask.multiply(ee.Image.pixelArea());
+  var stats = areaImage.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: region,
+    scale: scale,
+    maxPixels: 1e13,
+    bestEffort: true
+  });
+  var area_m2 = ee.Number(stats.get('snow')).max(0);
+  var area_km2 = area_m2.divide(1e6);
+  return {area_m2: area_m2, area_km2: area_km2};
+}
+
+// Helper: validation and metrics (samples classified image at validation points from MODIS)
+function validateClassification(classifiedImage, modisValidationImage, modisSnowAsset, modisNonSnowAsset, region, scatsatScale, modisScale, runName) {
+  var modisSnowPoints = multiPointToPointsFromCollection(modisSnowAsset, 1);
+  var modisNonSnowPoints = multiPointToPointsFromCollection(modisNonSnowAsset, 0);
+  var validationPoints = modisSnowPoints.merge(modisNonSnowPoints);
+
+  var modisValidationSamples = modisValidationImage.sampleRegions({
+    collection: validationPoints,
+    properties: ['class'],
+    scale: modisScale,
+    tileScale: 2,
+    geometries: true
+  });
+
+  var classifiedValidationSamples = classifiedImage.sampleRegions({
+    collection: modisValidationSamples,
+    properties: ['class'],
+    scale: scatsatScale,
+    tileScale: 2,
+    geometries: true
+  });
+
+  var confusionMatrix = classifiedValidationSamples.errorMatrix('class', 'classification');
+  print(runName + ' Confusion Matrix:', confusionMatrix);
+
+  var overallAccuracy = confusionMatrix.accuracy();
+  var kappaCoefficient = confusionMatrix.kappa();
+
+  // Classwise safe computations
+  var cm = confusionMatrix.array();
+  var TP = ee.Number(cm.get([1,1]));
+  var TN = ee.Number(cm.get([0,0]));
+  var FP = ee.Number(cm.get([0,1]));
+  var FN = ee.Number(cm.get([1,0]));
+
+  var userAccuracySnow = TP.divide(TP.add(FP));
+  var userAccuracyNonSnow = TN.divide(TN.add(FN));
+  var producerAccuracySnow = TP.divide(TP.add(FN));
+  var producerAccuracyNonSnow = TN.divide(TN.add(FP));
+  var f1Snow = userAccuracySnow.multiply(producerAccuracySnow).multiply(2).divide(userAccuracySnow.add(producerAccuracySnow));
+  var f1NonSnow = userAccuracyNonSnow.multiply(producerAccuracyNonSnow).multiply(2).divide(userAccuracyNonSnow.add(producerAccuracyNonSnow));
+
+  print(runName + ' Overall Accuracy:', overallAccuracy);
+  print(runName + ' Kappa Coefficient:', kappaCoefficient);
+  print(runName + ' User Accuracy (Snow):', userAccuracySnow);
+  print(runName + ' Producer Accuracy (Snow):', producerAccuracySnow);
+  print(runName + ' F1 Score (Snow):', f1Snow);
+
+  return {
+    confusionMatrix: confusionMatrix,
+    overallAccuracy: overallAccuracy,
+    kappa: kappaCoefficient,
+    userAccuracySnow: userAccuracySnow,
+    producerAccuracySnow: producerAccuracySnow,
+    f1Snow: f1Snow,
+    classifiedValidationSamples: classifiedValidationSamples
+  };
+}
+
+// ------------------------- Previously merged RF runs -------------------------
+// Run A1 Daily (adapted from your earlier merge)
+(function run_A1_Daily() {
+  var runName = 'RF_A1_Daily';
+  var validationMOD_A1_Daily = ee.Image('projects/ee-vishaldutt53/assets/Validation/mod10a1Daily_18-feb');
+
+  var clippedImage = scatsat.clip(shapefile);
+  var clippedMOD_A1_Daily = validationMOD_A1_Daily.clip(shapefile);
+
+  var snowPoints = multiPointToPointsFromCollection(trainSnowAsset, 1);
+  var nonSnowPoints = multiPointToPointsFromCollection(trainNonSnowAsset, 0);
+  var trainingData = snowPoints.merge(nonSnowPoints);
+
+  var bands = ['b2']; // as in original A1 file
+  var trainingSamples = clippedImage.select(bands).sampleRegions({
+    collection: trainingData,
+    properties: ['class'],
+    scale: 1000,
+    tileScale: 2
+  });
+
+  var classifier = ee.Classifier.smileRandomForest(150).train({
+    features: trainingSamples,
+    classProperty: 'class',
+    inputProperties: bands
+  });
+
+  var classifiedImage = clippedImage.select(bands).classify(classifier);
+
+  Map.addLayer(classifiedImage, {min:0, max:1, palette:['green','white']}, runName + ' Classified');
+  Map.addLayer(clippedMOD_A1_Daily, {min:0, max:1, palette:['black','white']}, 'MOD10A1_Daily');
+
+  // validation assets (ensure paths exist)
+  var Modis_Snow = ee.FeatureCollection('projects/ee-vishaldutt53/assets/MODA1_SnowPoints');
+  var Modis_nonsnow = ee.FeatureCollection('projects/ee-vishaldutt53/assets/MODA1_NonSnowPoints');
+
+  var metrics = validateClassification(classifiedImage, clippedMOD_A1_Daily, Modis_Snow, Modis_nonsnow, shapefile, 1000, 500, runName);
+
+  var area = computeSnowArea(classifiedImage, shapefile.geometry(), 1000);
+  print(runName + ' Total Snow Area (m2):', area.area_m2);
+  print(runName + ' Total Snow Area (km2):', area.area_km2);
+})();
+
+// Run A2 8Day (adapted)
+(function run_A2_8Day() {
+  var runName = 'RF_A2_8Day';
+  var validationMOD_A2 = ee.Image('projects/ee-vishaldutt53/assets/mod10_a2_49_2021_8day');
+
+  var clippedScatsat = scatsat.clip(shapefile);
+  var clippedMOD_A2 = validationMOD_A2.clip(shapefile);
+
+  var snowPoints = multiPointToPointsFromCollection(trainSnowAsset, 1);
+  var nonSnowPoints = multiPointToPointsFromCollection(trainNonSnowAsset, 0);
+  var trainingData = snowPoints.merge(nonSnowPoints);
+
+  var bands = ['b1','b2'];
+  var trainingSamples = clippedScatsat.select(bands).sampleRegions({
+    collection: trainingData,
+    properties: ['class'],
+    scale: 1000,
+    tileScale: 2
+  });
+
+  var classifier = ee.Classifier.smileRandomForest(200).train({
+    features: trainingSamples,
+    classProperty: 'class',
+    inputProperties: bands
+  });
+
+  var classifiedImage = clippedScatsat.select(bands).classify(classifier);
+
+  Map.addLayer(classifiedImage, {min:0, max:1, palette:['green','white']}, runName + ' Classified');
+  Map.addLayer(clippedMOD_A2, {min:0, max:1, palette:['black','white']}, 'MOD10_A2_8Day');
+
+  var A2_snow = ee.FeatureCollection('projects/ee-vishaldutt53/assets/GeometryPoints/MODIS_A2_SnowPoints');
+  var A2_nonsnow = ee.FeatureCollection('projects/ee-vishaldutt53/assets/GeometryPoints/MODIS_A2_NonSnowPoints');
+
+  var metrics = validateClassification(classifiedImage, clippedMOD_A2, A2_snow, A2_nonsnow, shapefile, 1000, 500, runName);
+
+  var area = computeSnowArea(classifiedImage, shapefile.geometry(), 1000);
+  print(runName + ' Total Snow Area (m2):', area.area_m2);
+  print(runName + ' Total Snow Area (km2):', area.area_km2);
+})();
+
+// Run MOD02 (adapted)
+(function run_MOD02() {
+  var runName = 'RF_MOD02';
+  var validationMOD02 = ee.Image('projects/ee-vishaldutt53/assets/mod02_18-feb_Daily');
+
+  var clippedScatsat = scatsat.clip(shapefile);
+  var clippedMOD02 = validationMOD02.clip(shapefile);
+
+  var snowPoints = multiPointToPointsFromCollection(trainSnowAsset, 1);
+  var nonSnowPoints = multiPointToPointsFromCollection(trainNonSnowAsset, 0);
+  var trainingData = snowPoints.merge(nonSnowPoints);
+
+  var bands = ['b1','b2'];
+  var trainingSamples = clippedScatsat.select(bands).sampleRegions({
+    collection: trainingData,
+    properties: ['class'],
+    scale: 1000,
+    tileScale: 2
+  });
+
+  var classifier = ee.Classifier.smileRandomForest(150).train({
+    features: trainingSamples,
+    classProperty: 'class',
+    inputProperties: bands
+  });
+
+  var classifiedImage = clippedScatsat.select(bands).classify(classifier);
+
+  Map.addLayer(classifiedImage, {min:0, max:1, palette:['green','white']}, runName + ' Classified');
+  Map.addLayer(clippedMOD02, {min:0, max:1, palette:['black','white']}, 'MOD02_Daily');
+
+  var MOD02_snow = ee.FeatureCollection('projects/ee-vishaldutt53/assets/GeometryPoints/MOD02_SnowPoints');
+  var MOD02_nonsnow = ee.FeatureCollection('projects/ee-vishaldutt53/assets/GeometryPoints/MOD02_NonSnowPoints');
+
+  var metrics = validateClassification(classifiedImage, clippedMOD02, MOD02_snow, MOD02_nonsnow, shapefile, 1000, 500, runName);
+
+  var area = computeSnowArea(classifiedImage, shapefile.geometry(), 1000);
+  print(runName + ' Total Snow Area (m2):', area.area_m2);
+  print(runName + ' Total Snow Area (km2):', area.area_km2);
+})();
+
+// ------------------------- NEW: SVM run (your additional file) -------------------------
+(function run_SVM_Preprocess() {
+  var runName = 'SVM_Preprocessed_Run';
+
+  // Validation images map (supplied in your new file)
+  var validationImages = {
+    'MOD10A1_Daily': ee.Image('projects/ee-vishaldutt53/assets/Validation/mod10a1Daily_18-feb'),
+    'MOD10A2_8Day': ee.Image('projects/ee-vishaldutt53/assets/mod10_a2_49_2021_8day'),
+    'MOD02_Daily': ee.Image('projects/ee-vishaldutt53/assets/mod02_18-feb_Daily')
+  };
+
+  // Clip to AOI
+  var clippedScatsat = scatsat.clip(shapefile);
+  var clippedValidationImages = {
+    'MOD10A1_Daily': validationImages.MOD10A1_Daily.clip(shapefile),
+    'MOD10A2_8Day': validationImages.MOD10A2_8Day.clip(shapefile),
+    'MOD02_Daily': validationImages.MOD02_Daily.clip(shapefile)
+  };
+
+  // Mask invalid pixels (value -9999)
+  var maskedScatsat = clippedScatsat.updateMask(clippedScatsat.neq(-9999));
+
+  // Compute min/max via reduceRegion
+  var bandStats = maskedScatsat.reduceRegion({
+    reducer: ee.Reducer.minMax(),
+    geometry: shapefile.geometry(),
+    scale: 2226,
+    bestEffort: true
+  });
+  var bandStatsDict = ee.Dictionary(bandStats);
+  print('SCATSAT-1 Band Stats (Before Normalization):', bandStatsDict);
+
+  // Normalize b2 (and b1 if present). Use safe checks for keys.
+  var hasB2 = bandStatsDict.contains('b2_min');
+  var normalized = ee.Image();
+  var bandsUsed = [];
+
+  if (hasB2) {
+    var b2Min = ee.Number(bandStatsDict.get('b2_min'));
+    var b2Max = ee.Number(bandStatsDict.get('b2_max'));
+    var normB2 = maskedScatsat.select('b2').subtract(b2Min).divide(b2Max.subtract(b2Min)).rename('b2');
+    normalized = normB2;
+    bandsUsed.push('b2');
+  } else {
+    // fallback: select first band available
+    normalized = maskedScatsat.select([0]).rename('b2');
+    bandsUsed.push('b2');
+  }
+
+  var hasB1 = bandStatsDict.contains('b1_min');
+  if (hasB1) {
+    var b1Min = ee.Number(bandStatsDict.get('b1_min'));
+    var b1Max = ee.Number(bandStatsDict.get('b1_max'));
+    var normB1 = maskedScatsat.select('b1').subtract(b1Min).divide(b1Max.subtract(b1Min)).rename('b1');
+    normalized = normalized.addBands(normB1);
+    bandsUsed.push('b1');
+  }
+
+  var preprocessedScatsat = normalized;
+  print('Bands used for classification (SVM run):', bandsUsed);
+
+  // Load training points and convert them into balanced point sets
+  var snow = trainSnowAsset;
+  var nonsnow = trainNonSnowAsset;
+  var snowGeometry = snow.first().geometry();
+  var nonSnowGeometry = nonsnow.first().geometry();
+  var snowPoints = multiPointToPointsFromGeometry(snowGeometry, 1);
+  var nonSnowPoints = multiPointToPointsFromGeometry(nonSnowGeometry, 0);
+
+  // Balance training data
+  var snowCount = snowPoints.size();
+  var nonSnowCount = nonSnowPoints.size();
+  print('SVM run - Snow Points:', snowCount);
+  print('SVM run - NonSnow Points:', nonSnowCount);
+
+  var balancedSnowPoints = snowPoints;
+  var balancedNonSnowPoints = nonSnowPoints;
+  balancedSnowPoints = ee.Algorithms.If(snowCount.gt(nonSnowCount),
+    snowPoints.randomColumn('rnd').sort('rnd').limit(nonSnowCount),
+    snowPoints);
+  balancedNonSnowPoints = ee.Algorithms.If(nonSnowCount.gt(snowCount),
+    nonSnowPoints.randomColumn('rnd').sort('rnd').limit(snowCount),
+    nonSnowPoints);
+
+  balancedSnowPoints = ee.FeatureCollection(balancedSnowPoints);
+  balancedNonSnowPoints = ee.FeatureCollection(balancedNonSnowPoints);
+
+  var trainingData = balancedSnowPoints.merge(balancedNonSnowPoints);
+  print('SVM Balanced Training Data size:', trainingData.size());
+
+  // Sample training pixels from preprocessed image
+  var trainingSamples = preprocessedScatsat.select(bandsUsed).sampleRegions({
+    collection: trainingData,
+    properties: ['class'],
+    scale: 1000,
+    tileScale: 2
+  });
+
+  // Train SVM classifier (RBF kernel) as in your file
+  var svmClassifier = ee.Classifier.libsvm({
+    kernelType: 'RBF',
+    cost: 100,
+    gamma: 1
+  }).train({
+    features: trainingSamples,
+    classProperty: 'class',
+    inputProperties: bandsUsed
+  });
+
+  var classifiedImage = preprocessedScatsat.select(bandsUsed).classify(svmClassifier);
+
+  // Visualization
+  var originalVis = { min: 0, max: 1 };
+  var classVis = { min: 0, max: 1, palette: ['green', 'white'] };
+  var modisVis = { min: 0, max: 1, palette: ['black', 'white'] };
+
+  Map.addLayer(preprocessedScatsat.select('b2'), originalVis, 'SVM - b2 Normalized');
+  Map.addLayer(classifiedImage, classVis, 'SVM Classified');
+
+  // Validation points assets (your mapping)
+  var validationPointsAssets = {
+    'MOD10A1_Daily': {
+      snow: ee.FeatureCollection('projects/ee-vishaldutt53/assets/GeometryPoints/MODA1_SnowPoints'),
+      nonsnow: ee.FeatureCollection('projects/ee-vishaldutt53/assets/GeometryPoints/MODA1_NonSnowPoints')
+    },
+    'MOD10A2_8Day': {
+      snow: ee.FeatureCollection('projects/ee-vishaldutt53/assets/GeometryPoints/MODIS_A2_SnowPoints'),
+      nonsnow: ee.FeatureCollection('projects/ee-vishaldutt53/assets/GeometryPoints/MODIS_A2_NonSnowPoints')
+    },
+    'MOD02_Daily': {
+      snow: ee.FeatureCollection('projects/ee-vishaldutt53/assets/GeometryPoints/MOD02_SnowPoints'),
+      nonsnow: ee.FeatureCollection('projects/ee-vishaldutt53/assets/GeometryPoints/MOD02_NonSnowPoints')
+    }
+  };
+
+  // Prepare validation point collections (converted)
+  var validationPointsData = {
+    'MOD10A1_Daily': {
+      snow: multiPointToPointsFromCollection(validationPointsAssets.MOD10A1_Daily.snow, 1),
+      nonsnow: multiPointToPointsFromCollection(validationPointsAssets.MOD10A1_Daily.nonsnow, 0)
+    },
+    'MOD10A2_8Day': {
+      snow: multiPointToPointsFromCollection(validationPointsAssets.MOD10A2_8Day.snow, 1),
+      nonsnow: multiPointToPointsFromCollection(validationPointsAssets.MOD10A2_8Day.nonsnow, 0)
+    },
+    'MOD02_Daily': {
+      snow: multiPointToPointsFromCollection(validationPointsAssets.MOD02_Daily.snow, 1),
+      nonsnow: multiPointToPointsFromCollection(validationPointsAssets.MOD02_Daily.nonsnow, 0)
+    }
+  };
+
+  // Function to calculate accuracy measures (returns dictionary) — reusing earlier calculateAccuracyMeasures logic but returning ee.Dictionary
+  function calculateAccuracyMeasuresDict(classifiedImageLocal, validationImageLocal, validationPointsLocal, name) {
+    var pointsFC = validationPointsLocal.snow.merge(validationPointsLocal.nonsnow);
+    var modisValidationSamples = validationImageLocal.sampleRegions({
+      collection: pointsFC,
+      properties: ['class'],
+      scale: 500,
+      tileScale: 2,
+      geometries: true
+    });
+    var classifiedValidationSamples = classifiedImageLocal.sampleRegions({
+      collection: modisValidationSamples,
+      properties: ['class'],
+      scale: 1000,
+      tileScale: 2,
+      geometries: true
+    });
+
+    var cm = classifiedValidationSamples.errorMatrix('class', 'classification');
+    var overallAccuracy = cm.accuracy();
+    var kappaCoefficient = cm.kappa();
+    var userAccuracySnow = cm.array().get([1,1]).divide(cm.array().get([1,1]).add(cm.array().get([0,1])));
+    var userAccuracyNonSnow = cm.array().get([0,0]).divide(cm.array().get([0,0]).add(cm.array().get([1,0])));
+    var producerAccuracySnow = cm.array().get([1,1]).divide(cm.array().get([1,1]).add(cm.array().get([1,0])));
+    var producerAccuracyNonSnow = cm.array().get([0,0]).divide(cm.array().get([0,0]).add(cm.array().get([0,1])));
+    var f1Snow = userAccuracySnow.multiply(producerAccuracySnow).multiply(2).divide(userAccuracySnow.add(producerAccuracySnow));
+    var f1NonSnow = userAccuracyNonSnow.multiply(producerAccuracyNonSnow).multiply(2).divide(userAccuracyNonSnow.add(producerAccuracyNonSnow));
+    var omissionErrorSnow = cm.array().get([1,0]).divide(cm.array().get([1,0]).add(cm.array().get([1,1])));
+    var omissionErrorNonSnow = cm.array().get([0,1]).divide(cm.array().get([0,1]).add(cm.array().get([0,0])));
+    var commissionErrorSnow = cm.array().get([0,1]).divide(cm.array().get([0,1]).add(cm.array().get([1,1])));
+    var commissionErrorNonSnow = cm.array().get([1,0]).divide(cm.array().get([1,0]).add(cm.array().get([0,0])));
+
+    return ee.Dictionary({
+      'Dataset': name,
+      'Overall_Accuracy': overallAccuracy,
+      'Kappa_Coefficient': kappaCoefficient,
+      'User_Accuracy_Snow': userAccuracySnow,
+      'User_Accuracy_NonSnow': userAccuracyNonSnow,
+      'Producer_Accuracy_Snow': producerAccuracySnow,
+      'Producer_Accuracy_NonSnow': producerAccuracyNonSnow,
+      'F1_Score_Snow': f1Snow,
+      'F1_Score_NonSnow': f1NonSnow,
+      'Omission_Error_Snow': omissionErrorSnow,
+      'Omission_Error_NonSnow': omissionErrorNonSnow,
+      'Commission_Error_Snow': commissionErrorSnow,
+      'Commission_Error_NonSnow': commissionErrorNonSnow
+    });
+  }
+
+  // Compute performance dictionaries for each validation dataset
+  var perf1 = calculateAccuracyMeasuresDict(classifiedImage, clippedValidationImages.MOD10A1_Daily, validationPointsData.MOD10A1_Daily, 'MOD10A1_Daily');
+  var perf2 = calculateAccuracyMeasuresDict(classifiedImage, clippedValidationImages.MOD10A2_8Day, validationPointsData.MOD10A2_8Day, 'MOD10A2_8Day');
+  var perf3 = calculateAccuracyMeasuresDict(classifiedImage, clippedValidationImages.MOD02_Daily, validationPointsData.MOD02_Daily, 'MOD02_Daily');
+
+  var performanceFC = ee.FeatureCollection([ee.Feature(null, perf1), ee.Feature(null, perf2), ee.Feature(null, perf3)]);
+  print('SVM Performance FeatureCollection:', performanceFC);
+
+  // Export performance table and classified image (uncomment exports if needed)
+  Export.table.toDrive({
+    collection: performanceFC,
+    description: 'SVM_Performance_Measures_All_Datasets',
+    folder: 'Uttrakhand_Results',
+    fileFormat: 'CSV'
+  });
+
+  Export.image.toDrive({
+    image: classifiedImage,
+    description: 'SVM_Classified_SCATSAT1',
+    folder: 'UK_ClassifiedImages',
+    fileNamePrefix: 'SVM_SCATSAT_Classification',
+    region: shapefile.geometry(),
+    scale: 1000,
+    maxPixels: 1e13,
+    fileFormat: 'GeoTIFF'
+  });
+
+  // Export clipped MODIS images
+  var modisExportNames = {
+    'MOD10A1_Daily': 'Clipped_MODIS_A1_Daily',
+    'MOD10A2_8Day': 'Clipped_MODIS_A2_8Day',
+    'MOD02_Daily': 'Clipped_MODIS_MOD02_Daily'
+  };
+  Object.keys(clippedValidationImages).forEach(function(key) {
+    Export.image.toDrive({
+      image: clippedValidationImages[key],
+      description: modisExportNames[key],
+      folder: 'GEE_Exports',
+      scale: 500,
+      region: shapefile.geometry(),
+      fileFormat: 'GeoTIFF',
+      maxPixels: 1e13
+    });
+  });
+
+  // Compute snow area for SVM classified image
+  var svmArea = computeSnowArea(classifiedImage, shapefile.geometry(), 1000);
+  print(runName + ' Total Snow Area (m2):', svmArea.area_m2);
+  print(runName + ' Total Snow Area (km2):', svmArea.area_km2);
+
+  // Simple UI panels / charts for SVM run
+  Map.centerObject(shapefile, 7);
+  Map.addLayer(clippedValidationImages.MOD10A1_Daily, modisVis, 'MOD10A1_Daily (clipped)');
+  var panel = ui.Panel({layout: ui.Panel.Layout.flow('horizontal')});
+  Map.add(panel);
+  var classifiedLayer = ui.Map.Layer(classifiedImage, classVis, 'SVM_S1L4_SN');
+  var modisLayerMOD10A1 = ui.Map.Layer(clippedValidationImages.MOD10A1_Daily, modisVis, 'MOD10A1_Daily');
+  var slider = ui.Slider({
+    min: 0,
+    max: 1,
+    value: 0.5,
+    step: 0.01,
+    onChange: function(value) {
+      classifiedLayer.setOpacity(value);
+      modisLayerMOD10A1.setOpacity(1 - value);
+    }
+  });
+  panel.add(ui.Label('Slide to Compare SVM vs MOD10A1'));
+  panel.add(slider);
+
+})(); // end SVM run
+
+// ------------------------- Final map center & message -------------------------
+Map.centerObject(shapefile, 7);
+print('All runs completed in this script. Check Console for metrics and area values for each run.');
